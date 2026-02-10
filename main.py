@@ -11,7 +11,6 @@ CORS(app)  # Allows Appian to talk to this API
 DB_FILE = "music_domain.db"
 
 # --- CONFIGURATION ---
-# UPDATE THIS LATER with your actual Appian WebAPI URL
 APPIAN_WEBHOOK_URL = os.environ.get("APPIAN_WEBHOOK_URL", "")
 APPIAN_API_KEY = os.environ.get("APPIAN_API_KEY", "")
 
@@ -33,6 +32,7 @@ def init_db():
     with app.app_context():
         db = get_db()
         cursor = db.cursor()
+        
         # Artist Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS artist (
@@ -80,9 +80,6 @@ def get_timestamp():
 
 # --- WEBHOOK TRIGGER ---
 def trigger_appian_sync(artist_id):
-    """
-    Notifies Appian that an Artist (Aggregate Root) has changed.
-    """
     if APPIAN_WEBHOOK_URL:
         try:
             print(f"FIRING WEBHOOK to Appian for Artist ID: {artist_id}")
@@ -94,28 +91,60 @@ def trigger_appian_sync(artist_id):
             )
         except Exception as e:
             print(f"Webhook failed: {e}")
-    else:
-        print("Webhook skipped: No APPIAN_WEBHOOK_URL configured.")
 
-# --- GET APIs (Read) ---
-
+# --- UNIVERSAL GET FUNCTION (Paging & Batching) ---
 def generic_get(table_name, pk_column):
-    """Handles GET All and GET by IDs (Batching)"""
     ids_param = request.args.get('ids')
+    
+    # Pagination Parameters (Defaults: Page 1, Limit 50)
+    try:
+        page = int(request.args.get('page', 1))
+        limit = int(request.args.get('limit', 50))
+    except ValueError:
+        page = 1
+        limit = 50
+        
+    offset = (page - 1) * limit
+    
     cur = get_db().cursor()
     
     if ids_param:
-        # Batch Fetch for Appian Sync
+        # BATCH MODE: Fetch specific IDs (ignores paging usually)
+        # Handle empty string case
+        if ids_param.strip() == "":
+             return jsonify({"total": 0, "data": []})
+             
         id_list = ids_param.split(',')
+        # Secure way to handle IN clause with variable length
         placeholders = ','.join('?' for _ in id_list)
         query = f"SELECT * FROM {table_name} WHERE {pk_column} IN ({placeholders})"
         cur.execute(query, id_list)
-    else:
-        # Fetch All
-        cur.execute(f"SELECT * FROM {table_name}")
+        rows = cur.fetchall()
         
-    rows = cur.fetchall()
-    return jsonify([dict(row) for row in rows])
+        # For batch sync, total is just what we found
+        total_count = len(rows)
+        data = [dict(row) for row in rows]
+        
+    else:
+        # PAGING MODE: Fetch slice
+        
+        # 1. Get Total Count (Required for Appian to know when to stop)
+        cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+        total_count = cur.fetchone()[0]
+        
+        # 2. Get Data for this Page
+        query = f"SELECT * FROM {table_name} LIMIT ? OFFSET ?"
+        cur.execute(query, (limit, offset))
+        rows = cur.fetchall()
+        data = [dict(row) for row in rows]
+
+    # Return the envelope Appian expects
+    return jsonify({
+        "total": total_count,
+        "data": data
+    })
+
+# --- ROUTE HANDLERS ---
 
 @app.route('/artists', methods=['GET'])
 def get_artists(): return generic_get('artist', 'artist_id')
@@ -125,6 +154,7 @@ def get_artist(id):
     cur = get_db().cursor()
     cur.execute("SELECT * FROM artist WHERE artist_id = ?", (id,))
     row = cur.fetchone()
+    # Return single object (no wrapper needed for single-record sync usually, but consistent helps)
     return jsonify(dict(row) if row else {})
 
 @app.route('/albums', methods=['GET'])
@@ -148,44 +178,34 @@ def get_song(id):
     return jsonify(dict(row) if row else {})
 
 
-# --- PUT APIs (Create & Domain Logic) ---
+# --- CREATE APIs (PUT) ---
 
 @app.route('/artists', methods=['PUT'])
 def create_artist():
     data = request.get_json() or {}
     db = get_db()
     cur = db.cursor()
-    
     cur.execute(
         "INSERT INTO artist (artist_name, status_id, updated_on, updated_by) VALUES (?, ?, ?, ?)",
-        (data.get('artist_name', 'Unknown Artist'), 1, get_timestamp(), data.get('updated_by', 'Appian'))
+        (data.get('artist_name', 'Unknown'), 1, get_timestamp(), data.get('updated_by', 'Appian'))
     )
     db.commit()
-    new_id = cur.lastrowid
-    
-    # Appian often needs the ID back immediately
-    return jsonify({"id": new_id, "message": "Artist created"}), 201
+    return jsonify({"id": cur.lastrowid, "message": "Artist created"}), 201
 
 @app.route('/albums', methods=['PUT'])
 def create_album():
     data = request.get_json() or {}
     db = get_db()
     cur = db.cursor()
-    
-    # 1. Create Album
+    # Create Album
     cur.execute(
         "INSERT INTO album (artist_id, album_name, updated_on, updated_by) VALUES (?, ?, ?, ?)",
         (data.get('artist_id'), data.get('album_name'), get_timestamp(), data.get('updated_by', 'Appian'))
     )
-    
-    # 2. DDD Ripple: Update Parent Artist Timestamp
+    # Update Parent (Artist)
     cur.execute("UPDATE artist SET updated_on = ? WHERE artist_id = ?", (get_timestamp(), data.get('artist_id')))
-    
     db.commit()
-    
-    # 3. Fire Webhook (Artist changed because Album was added)
     trigger_appian_sync(data.get('artist_id'))
-    
     return jsonify({"id": cur.lastrowid, "message": "Album created"}), 201
 
 @app.route('/songs', methods=['PUT'])
@@ -193,21 +213,15 @@ def create_song():
     data = request.get_json() or {}
     db = get_db()
     cur = db.cursor()
-    
-    # 1. Create Song
+    # Create Song
     cur.execute(
         "INSERT INTO song (artist_id, album_id, song_name, updated_on, updated_by) VALUES (?, ?, ?, ?, ?)",
         (data.get('artist_id'), data.get('album_id'), data.get('song_name'), get_timestamp(), data.get('updated_by', 'Postman'))
     )
-    
-    # 2. DDD Ripple: Update Parent Artist Timestamp
+    # Update Parent (Artist)
     cur.execute("UPDATE artist SET updated_on = ? WHERE artist_id = ?", (get_timestamp(), data.get('artist_id')))
-    
     db.commit()
-    
-    # 3. Fire Webhook (Artist changed because Song was added)
     trigger_appian_sync(data.get('artist_id'))
-    
     return jsonify({"id": cur.lastrowid, "message": "Song created"}), 201
 
 if __name__ == '__main__':
