@@ -2,16 +2,14 @@ import os
 import requests
 from typing import List, Optional
 from datetime import date
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Body
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 
-# --- 1. INFRASTRUCTURE LAYER (Database) ---
+# --- 1. INFRASTRUCTURE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Handle standard Postgres URL format for SQLAlchemy
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -19,14 +17,12 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- 2. DOMAIN MODELS (The Tables) ---
+# --- 2. DATABASE MODELS ---
 class CustomerModel(Base):
     __tablename__ = "customers"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String)
     email = Column(String, unique=True, index=True)
-    
-    # Relationship: One Customer has Many Orders
     orders = relationship("OrderModel", back_populates="customer", cascade="all, delete-orphan")
 
 class OrderModel(Base):
@@ -36,8 +32,6 @@ class OrderModel(Base):
     order_date = Column(Date)
     status = Column(String, default="Draft")
     total_amount = Column(Float, default=0.0)
-
-    # Relationships
     customer = relationship("CustomerModel", back_populates="orders")
     items = relationship("LineItemModel", back_populates="order", cascade="all, delete-orphan")
 
@@ -48,37 +42,49 @@ class LineItemModel(Base):
     product_name = Column(String)
     quantity = Column(Integer)
     price = Column(Float)
-
-    # Relationship
     order = relationship("OrderModel", back_populates="items")
 
-# Create Tables on Startup
 Base.metadata.create_all(bind=engine)
 
-# --- 3. DTOs (Data Transfer Objects for API) ---
+# --- 3. PYDANTIC DTOs (FIXED) ---
+# We add 'orm_mode' so FastAPI can read data from SQLAlchemy objects
+
 class LineItemDTO(BaseModel):
     product_name: str
     quantity: int
     price: float
+    
+    class Config:
+        orm_mode = True
 
 class OrderDTO(BaseModel):
+    id: Optional[int] # Added ID so we can see it in response
     customer_id: int
     order_date: date
     status: str
-    items: List[LineItemDTO] = [] # Nested Writes supported
+    total_amount: Optional[float] # Read-only, calculated by backend
+    items: List[LineItemDTO] = []
+
+    class Config:
+        orm_mode = True
 
 class CustomerDTO(BaseModel):
+    id: Optional[int]
     name: str
     email: str
 
-# --- 4. API CONFIGURATION ---
+    class Config:
+        orm_mode = True
+
+class OrderUpdateDTO(BaseModel):
+    status: str
+
+# --- 4. API SETUP ---
 app = FastAPI()
 
-# Appian Webhook Config
 APPIAN_WEBHOOK_URL = "https://<YOUR_APPIAN_SITE>/suite/webapi/refresh-order"
 APPIAN_API_KEY = "<YOUR_APPIAN_API_KEY>"
 
-# Dependency to get DB session
 def get_db():
     db = SessionLocal()
     try:
@@ -86,10 +92,8 @@ def get_db():
     finally:
         db.close()
 
-# --- 5. HELPER FUNCTION ---
 def trigger_appian_webhook(order_id):
     try:
-        # Note: In production, use a background task (e.g., Celery) for this
         requests.post(
             APPIAN_WEBHOOK_URL, 
             json={"id": order_id},
@@ -100,10 +104,9 @@ def trigger_appian_webhook(order_id):
     except Exception as e:
         print(f"Webhook failed: {e}")
 
-# --- 6. API ENDPOINTS ---
+# --- 5. ENDPOINTS ---
 
-# --- CUSTOMERS ---
-@app.post("/customers/")
+@app.post("/customers/", response_model=CustomerDTO)
 def create_customer(customer: CustomerDTO, db: Session = Depends(get_db)):
     db_cust = CustomerModel(name=customer.name, email=customer.email)
     db.add(db_cust)
@@ -111,6 +114,59 @@ def create_customer(customer: CustomerDTO, db: Session = Depends(get_db)):
     db.refresh(db_cust)
     return db_cust
 
-@app.get("/customers/")
-def get_customers(
-    skip
+@app.get("/customers/", response_model=List[CustomerDTO])
+def get_customers(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    return db.query(CustomerModel).offset(skip).limit(limit).all()
+
+@app.post("/orders/", response_model=OrderDTO)
+def create_order(order: OrderDTO, db: Session = Depends(get_db)):
+    db_order = OrderModel(
+        customer_id=order.customer_id,
+        order_date=order.order_date,
+        status=order.status,
+        total_amount=0
+    )
+    db.add(db_order)
+    db.commit()
+    db.refresh(db_order)
+
+    total = 0.0
+    for item in order.items:
+        db_item = LineItemModel(
+            order_id=db_order.id,
+            product_name=item.product_name,
+            quantity=item.quantity,
+            price=item.price
+        )
+        total += (item.quantity * item.price)
+        db.add(db_item)
+    
+    db_order.total_amount = total
+    db.commit()
+    db.refresh(db_order)
+    
+    trigger_appian_webhook(db_order.id)
+    return db_order
+
+@app.get("/orders/", response_model=List[OrderDTO])
+def get_orders(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    return db.query(OrderModel).offset(skip).limit(limit).all()
+
+@app.get("/orders/{order_id}", response_model=OrderDTO)
+def get_order(order_id: int, db: Session = Depends(get_db)):
+    return db.query(OrderModel).filter(OrderModel.id == order_id).first()
+
+# FIX: Now accepts a JSON Body for the status update
+@app.patch("/orders/{order_id}")
+def update_order_status(order_id: int, update: OrderUpdateDTO, db: Session = Depends(get_db)):
+    db_order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Update the status
+    db_order.status = update.status
+    db.commit()
+    
+    trigger_appian_webhook(order_id)
+    
+    return {"message": "Status updated", "id": order_id, "new_status": update.status}
